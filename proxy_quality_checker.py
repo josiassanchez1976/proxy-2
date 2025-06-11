@@ -16,6 +16,7 @@ The implementation focuses on clarity and modularity. Many complex network
 operations are simplified to keep the example concise.
 """
 
+import argparse
 import json
 import os
 import socket
@@ -73,7 +74,7 @@ def save_config(config: Dict[str, str]) -> None:
         json.dump(config, f)
 
 
-def parse_proxy_line(line: str) -> Optional[ProxyInfo]:
+def parse_proxy_line(line: str, default_type: str = "http") -> Optional[ProxyInfo]:
     line = line.strip()
     if not line or line.startswith("#"):
         return None
@@ -81,19 +82,25 @@ def parse_proxy_line(line: str) -> Optional[ProxyInfo]:
     if len(parts) < 2:
         return None
     ip, port = parts[0], parts[1]
-    ptype = parts[2].lower() if len(parts) > 2 else "http"
+    ptype = parts[2].lower() if len(parts) > 2 else default_type
     if ptype not in {"http", "https", "socks4", "socks5"}:
-        ptype = "http"
+        ptype = default_type
     return ProxyInfo(address=f"{ip}:{port}", proxy_type=ptype, raw=line)
 
 
 def load_proxies(path: str) -> List[ProxyInfo]:
-    proxies = []
+    lines = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            info = parse_proxy_line(line)
-            if info:
-                proxies.append(info)
+            if line.strip():
+                lines.append(line.strip())
+
+    default_type = detectar_tipo_de_proxies(lines)
+    proxies: List[ProxyInfo] = []
+    for line in lines:
+        info = parse_proxy_line(line, default_type)
+        if info:
+            proxies.append(info)
     return proxies
 
 
@@ -142,7 +149,10 @@ def mostrar_en_tabla(resultado: ProxyInfo) -> None:
     APP_INSTANCE._update_tree(resultado)
 
 
-def verificar_lista_de_proxies_concurrente(proxies: List[ProxyInfo], max_workers: int = 20) -> None:
+def verificar_lista_de_proxies_concurrente(
+    proxies: List[ProxyInfo], max_workers: int = 20
+) -> List[ProxyInfo]:
+    """Verifica en paralelo y devuelve solo los proxies válidos."""
     valid: List[ProxyInfo] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(analyze_proxy, p) for p in proxies]
@@ -150,9 +160,11 @@ def verificar_lista_de_proxies_concurrente(proxies: List[ProxyInfo], max_workers
             resultado = future.result()
             if resultado:
                 valid.append(resultado)
-                mostrar_en_tabla(resultado)
+                if APP_INSTANCE is not None:
+                    mostrar_en_tabla(resultado)
     if APP_INSTANCE is not None:
         APP_INSTANCE.proxies = valid
+    return valid
 
 # ------------------------------ Network Checks ------------------------------ #
 
@@ -509,9 +521,35 @@ class ProxyCheckerApp:
                     f.write(f"{p.address}:{p.proxy_type}\n")
         messagebox.showinfo("Exportar", f"Se exportaron {len(valid)} proxies válidos")
 
+# ------------------------------ CLI ------------------------------ #
+
+def analyze_file_cli(path: str) -> None:
+    """Analiza un archivo de proxies en modo consola."""
+    proxies = load_proxies(path)
+    valid = verificar_lista_de_proxies_concurrente(proxies)
+
+    if not valid:
+        print("No se encontraron proxies válidos.")
+        return
+
+    print("Proxies válidos:")
+    for p in valid:
+        print(f"{p.address} ({p.proxy_type})")
+
 # ------------------------------ Main ------------------------------ #
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Proxy Quality Checker")
+    parser.add_argument(
+        "--file",
+        help="Archivo de proxies para análisis en modo consola",
+    )
+    args = parser.parse_args()
+
+    if args.file:
+        analyze_file_cli(args.file)
+        return
+
     root = tk.Tk()
     global APP_INSTANCE
     app = ProxyCheckerApp(root)
