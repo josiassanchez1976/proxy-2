@@ -152,7 +152,7 @@ def mostrar_en_tabla(resultado: ProxyInfo) -> None:
 def verificar_lista_de_proxies_concurrente(
     proxies: List[ProxyInfo], max_workers: int = 20
 ) -> List[ProxyInfo]:
-    """Verifica en paralelo y devuelve solo los proxies válidos."""
+    """Verifica en paralelo y devuelve solo los proxies activos y limpios."""
     valid: List[ProxyInfo] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(analyze_proxy, p) for p in proxies]
@@ -160,10 +160,6 @@ def verificar_lista_de_proxies_concurrente(
             resultado = future.result()
             if resultado:
                 valid.append(resultado)
-                if APP_INSTANCE is not None:
-                    mostrar_en_tabla(resultado)
-    if APP_INSTANCE is not None:
-        APP_INSTANCE.proxies = valid
     return valid
 
 # ------------------------------ Network Checks ------------------------------ #
@@ -376,15 +372,10 @@ class ProxyCheckerApp:
         file_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
         if not file_path:
             return
-        proxies = load_proxies(file_path)
         self.tree.delete(*self.tree.get_children())
         self.results.clear()
-        self.proxies = []
-        threading.Thread(
-            target=verificar_lista_de_proxies_concurrente,
-            args=(proxies,),
-            daemon=True,
-        ).start()
+        self.proxies = load_proxies(file_path)
+        self.progress.config(text=f"{len(self.proxies)} proxies cargados")
 
     def configure_apis(self) -> None:
         top = tk.Toplevel(self.root)
@@ -420,10 +411,10 @@ class ProxyCheckerApp:
 
     def _analyze_all(self) -> None:
         self.progress.config(text="Analizando...")
-        for proxy in self.proxies:
+        valid = verificar_lista_de_proxies_concurrente(self.proxies)
+        self.proxies = valid
+        for proxy in valid:
             self.progress.config(text=f"Analizando {proxy.address}")
-            if not check_connectivity(proxy):
-                continue
             fetch_geolocation(proxy)
             check_dnsbl(proxy)
             external_detection(proxy, self.config)
