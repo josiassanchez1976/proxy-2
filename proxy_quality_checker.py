@@ -16,6 +16,7 @@ The implementation focuses on clarity and modularity. Many complex network
 operations are simplified to keep the example concise.
 """
 
+import argparse
 import json
 import os
 import socket
@@ -73,7 +74,7 @@ def save_config(config: Dict[str, str]) -> None:
         json.dump(config, f)
 
 
-def parse_proxy_line(line: str) -> Optional[ProxyInfo]:
+def parse_proxy_line(line: str, default_type: str = "http") -> Optional[ProxyInfo]:
     line = line.strip()
     if not line or line.startswith("#"):
         return None
@@ -81,19 +82,25 @@ def parse_proxy_line(line: str) -> Optional[ProxyInfo]:
     if len(parts) < 2:
         return None
     ip, port = parts[0], parts[1]
-    ptype = parts[2].lower() if len(parts) > 2 else "http"
+    ptype = parts[2].lower() if len(parts) > 2 else default_type
     if ptype not in {"http", "https", "socks4", "socks5"}:
-        ptype = "http"
+        ptype = default_type
     return ProxyInfo(address=f"{ip}:{port}", proxy_type=ptype, raw=line)
 
 
 def load_proxies(path: str) -> List[ProxyInfo]:
-    proxies = []
+    lines = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            info = parse_proxy_line(line)
-            if info:
-                proxies.append(info)
+            if line.strip():
+                lines.append(line.strip())
+
+    default_type = detectar_tipo_de_proxies(lines)
+    proxies: List[ProxyInfo] = []
+    for line in lines:
+        info = parse_proxy_line(line, default_type)
+        if info:
+            proxies.append(info)
     return proxies
 
 
@@ -126,12 +133,21 @@ def is_blacklisted(ip: str) -> bool:
     return False
 
 
-def analyze_proxy(proxy: ProxyInfo) -> Optional[ProxyInfo]:
+def analyze_proxy(proxy: ProxyInfo, config: Optional[Dict[str, str]] = None) -> Optional[ProxyInfo]:
+    """Realiza todo el análisis de un proxy y lo devuelve si es válido."""
     ip, port = proxy.address.split(":")
     if not proxy_is_alive(ip, int(port), proxy.proxy_type):
         return None
-    if is_blacklisted(ip):
+
+    check_dnsbl(proxy)
+    if proxy.blacklisted:
         return None
+
+    fetch_geolocation(proxy)
+    if config:
+        external_detection(proxy, config)
+    measure_performance(proxy)
+    calculate_score(proxy)
     return proxy
 
 
@@ -142,17 +158,20 @@ def mostrar_en_tabla(resultado: ProxyInfo) -> None:
     APP_INSTANCE._update_tree(resultado)
 
 
-def verificar_lista_de_proxies_concurrente(proxies: List[ProxyInfo], max_workers: int = 20) -> None:
+def analizar_proxies_concurrente(
+    proxies: List[ProxyInfo],
+    config: Dict[str, str],
+    max_workers: int = 20,
+) -> List[ProxyInfo]:
+    """Analiza todos los proxies en paralelo y devuelve solo los válidos."""
     valid: List[ProxyInfo] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(analyze_proxy, p) for p in proxies]
+        futures = [executor.submit(analyze_proxy, p, config) for p in proxies]
         for future in as_completed(futures):
             resultado = future.result()
             if resultado:
                 valid.append(resultado)
-                mostrar_en_tabla(resultado)
-    if APP_INSTANCE is not None:
-        APP_INSTANCE.proxies = valid
+    return valid
 
 # ------------------------------ Network Checks ------------------------------ #
 
@@ -364,15 +383,10 @@ class ProxyCheckerApp:
         file_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
         if not file_path:
             return
-        proxies = load_proxies(file_path)
         self.tree.delete(*self.tree.get_children())
         self.results.clear()
-        self.proxies = []
-        threading.Thread(
-            target=verificar_lista_de_proxies_concurrente,
-            args=(proxies,),
-            daemon=True,
-        ).start()
+        self.proxies = load_proxies(file_path)
+        self.progress.config(text=f"{len(self.proxies)} proxies cargados")
 
     def configure_apis(self) -> None:
         top = tk.Toplevel(self.root)
@@ -407,19 +421,18 @@ class ProxyCheckerApp:
         threading.Thread(target=self._analyze_all, daemon=True).start()
 
     def _analyze_all(self) -> None:
-        self.progress.config(text="Analizando...")
-        for proxy in self.proxies:
-            self.progress.config(text=f"Analizando {proxy.address}")
-            if not check_connectivity(proxy):
-                continue
-            fetch_geolocation(proxy)
-            check_dnsbl(proxy)
-            external_detection(proxy, self.config)
-            measure_performance(proxy)
-            calculate_score(proxy)
-            self.results.append(proxy)
-            self._update_tree(proxy)
-        self.progress.config(text="Listo")
+        self.root.after(0, lambda: self.progress.config(text="Analizando..."))
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(analyze_proxy, p, self.config) for p in self.proxies]
+
+            for future in as_completed(futures):
+                resultado = future.result()
+                if resultado:
+                    self.results.append(resultado)
+                    self.root.after(0, lambda r=resultado: self._update_tree(r))
+
+        self.root.after(0, lambda: self.progress.config(text="Análisis completo."))
 
     def _update_tree(self, proxy: ProxyInfo) -> None:
         color = "red"
@@ -509,9 +522,36 @@ class ProxyCheckerApp:
                     f.write(f"{p.address}:{p.proxy_type}\n")
         messagebox.showinfo("Exportar", f"Se exportaron {len(valid)} proxies válidos")
 
+# ------------------------------ CLI ------------------------------ #
+
+def analyze_file_cli(path: str) -> None:
+    """Analiza un archivo de proxies en modo consola."""
+    proxies = load_proxies(path)
+    config = load_config()
+    valid = analizar_proxies_concurrente(proxies, config)
+
+    if not valid:
+        print("No se encontraron proxies válidos.")
+        return
+
+    print("Proxies válidos:")
+    for p in valid:
+        print(f"{p.address} ({p.proxy_type})")
+
 # ------------------------------ Main ------------------------------ #
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Proxy Quality Checker")
+    parser.add_argument(
+        "--file",
+        help="Archivo de proxies para análisis en modo consola",
+    )
+    args = parser.parse_args()
+
+    if args.file:
+        analyze_file_cli(args.file)
+        return
+
     root = tk.Tk()
     global APP_INSTANCE
     app = ProxyCheckerApp(root)
