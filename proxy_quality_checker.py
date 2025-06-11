@@ -133,12 +133,21 @@ def is_blacklisted(ip: str) -> bool:
     return False
 
 
-def analyze_proxy(proxy: ProxyInfo) -> Optional[ProxyInfo]:
+def analyze_proxy(proxy: ProxyInfo, config: Optional[Dict[str, str]] = None) -> Optional[ProxyInfo]:
+    """Realiza todo el análisis de un proxy y lo devuelve si es válido."""
     ip, port = proxy.address.split(":")
     if not proxy_is_alive(ip, int(port), proxy.proxy_type):
         return None
-    if is_blacklisted(ip):
+
+    check_dnsbl(proxy)
+    if proxy.blacklisted:
         return None
+
+    fetch_geolocation(proxy)
+    if config:
+        external_detection(proxy, config)
+    measure_performance(proxy)
+    calculate_score(proxy)
     return proxy
 
 
@@ -149,13 +158,15 @@ def mostrar_en_tabla(resultado: ProxyInfo) -> None:
     APP_INSTANCE._update_tree(resultado)
 
 
-def verificar_lista_de_proxies_concurrente(
-    proxies: List[ProxyInfo], max_workers: int = 20
+def analizar_proxies_concurrente(
+    proxies: List[ProxyInfo],
+    config: Dict[str, str],
+    max_workers: int = 20,
 ) -> List[ProxyInfo]:
-    """Verifica en paralelo y devuelve solo los proxies activos y limpios."""
+    """Analiza todos los proxies en paralelo y devuelve solo los válidos."""
     valid: List[ProxyInfo] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(analyze_proxy, p) for p in proxies]
+        futures = [executor.submit(analyze_proxy, p, config) for p in proxies]
         for future in as_completed(futures):
             resultado = future.result()
             if resultado:
@@ -410,19 +421,18 @@ class ProxyCheckerApp:
         threading.Thread(target=self._analyze_all, daemon=True).start()
 
     def _analyze_all(self) -> None:
-        self.progress.config(text="Analizando...")
-        valid = verificar_lista_de_proxies_concurrente(self.proxies)
-        self.proxies = valid
-        for proxy in valid:
-            self.progress.config(text=f"Analizando {proxy.address}")
-            fetch_geolocation(proxy)
-            check_dnsbl(proxy)
-            external_detection(proxy, self.config)
-            measure_performance(proxy)
-            calculate_score(proxy)
-            self.results.append(proxy)
-            self._update_tree(proxy)
-        self.progress.config(text="Listo")
+        self.root.after(0, lambda: self.progress.config(text="Analizando..."))
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(analyze_proxy, p, self.config) for p in self.proxies]
+
+            for future in as_completed(futures):
+                resultado = future.result()
+                if resultado:
+                    self.results.append(resultado)
+                    self.root.after(0, lambda r=resultado: self._update_tree(r))
+
+        self.root.after(0, lambda: self.progress.config(text="Análisis completo."))
 
     def _update_tree(self, proxy: ProxyInfo) -> None:
         color = "red"
@@ -517,7 +527,8 @@ class ProxyCheckerApp:
 def analyze_file_cli(path: str) -> None:
     """Analiza un archivo de proxies en modo consola."""
     proxies = load_proxies(path)
-    valid = verificar_lista_de_proxies_concurrente(proxies)
+    config = load_config()
+    valid = analizar_proxies_concurrente(proxies, config)
 
     if not valid:
         print("No se encontraron proxies válidos.")
